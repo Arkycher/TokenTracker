@@ -1136,6 +1136,7 @@ function spawnDetached(argv) {
 function resolveMaybeHome(p) {
   if (typeof p !== 'string') return null;
   if (p.startsWith('~/')) return path.join(home, p.slice(2));
+  if (p.startsWith('~\\\\')) return path.join(home, p.slice(2));
   return path.resolve(p);
 }
 
@@ -1151,12 +1152,13 @@ function isSelfNotify(cmd) {
 
 function shouldChainNotify(cmd) {
   if (!Array.isArray(cmd) || cmd.length === 0) return false;
-  return isRunnableCommand(cmd[0]);
+  if (!isRunnableCommand(cmd[0])) return false;
+  return hasRunnableInterpreterTarget(cmd);
 }
 
 function isRunnableCommand(command) {
   if (typeof command !== 'string' || command.length === 0) return false;
-  const explicitPath = command.startsWith('~/') || command.includes('/');
+  const explicitPath = isExplicitPath(command);
   if (!explicitPath) return true;
   const resolved = resolveMaybeHome(command);
   if (!resolved) return false;
@@ -1166,6 +1168,541 @@ function isRunnableCommand(command) {
   } catch (_) {
     return false;
   }
+}
+
+function hasRunnableInterpreterTarget(cmd) {
+  const interpreterCmd = normalizeInterpreterCommand(cmd);
+  if (!interpreterCmd || interpreterCmd.length === 0) return false;
+  const targetIndex = findInterpreterTargetIndex(interpreterCmd);
+  if (targetIndex == null) return true;
+  if (targetIndex === -2) return true;
+  if (targetIndex === -1) return false;
+  const target = interpreterCmd[targetIndex];
+  if (!isExplicitPath(target)) return false;
+  return isReadablePath(target);
+}
+
+function normalizeInterpreterCommand(cmd) {
+  if (!isEnvCommand(cmd[0])) return cmd;
+  return extractEnvCommand(cmd);
+}
+
+function findInterpreterTargetIndex(cmd) {
+  const command = cmd[0];
+  if (isNodeCommand(command)) {
+    return findNodeLikeScriptIndex(cmd, 1);
+  }
+  if (isBunCommand(command)) {
+    return findBunScriptIndex(cmd, 1);
+  }
+  if (isDenoCommand(command)) {
+    return findDenoScriptIndex(cmd, 1);
+  }
+  return null;
+}
+
+function isEnvCommand(command) {
+  const base = commandBase(command);
+  return base === 'env';
+}
+
+function extractEnvCommand(cmd) {
+  return normalizeEnvArgs(cmd.slice(1));
+}
+
+function normalizeEnvArgs(args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (typeof arg !== 'string' || arg.length === 0) return null;
+    if (arg === '-' || arg === '--ignore-environment' || isEnvValuelessShortOption(arg)) continue;
+    if (arg === '--') return normalizeEnvCommandOperands(args.slice(i + 1));
+    if (arg === '-S' || arg === '--split-string') {
+      const split = splitEnvString(args[i + 1]);
+      if (!split) return null;
+      return normalizeEnvArgs(split.concat(args.slice(i + 2)));
+    }
+    if (arg.startsWith('--split-string=')) {
+      const split = splitEnvString(arg.slice('--split-string='.length));
+      if (!split) return null;
+      return normalizeEnvArgs(split.concat(args.slice(i + 1)));
+    }
+    if (arg === '-u' || arg === '--unset') {
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith('--unset=')) continue;
+    if (isEnvValueOption(arg)) {
+      i += 1;
+      continue;
+    }
+    if (isEnvInlineValueOption(arg)) continue;
+    if (arg.startsWith('-')) return null;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) continue;
+    return args.slice(i);
+  }
+  return null;
+}
+
+function normalizeEnvCommandOperands(args) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (typeof arg !== 'string' || arg.length === 0) return null;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)) continue;
+    if (arg.startsWith('-')) return null;
+    return args.slice(i);
+  }
+  return null;
+}
+
+function isEnvValuelessShortOption(arg) {
+  return /^-[0iv]+$/.test(arg);
+}
+
+function isEnvValueOption(arg) {
+  return arg === '-C' || arg === '-P' || arg === '--chdir' || arg === '--path';
+}
+
+function isEnvInlineValueOption(arg) {
+  return (
+    arg.startsWith('--chdir=') ||
+    arg.startsWith('--path=')
+  );
+}
+
+function splitEnvString(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  const parts = [];
+  let current = '';
+  let quote = null;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\\\' && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\\s/.test(ch)) {
+      if (current.length > 0) {
+        parts.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (escaped || quote) return null;
+  if (current.length > 0) parts.push(current);
+  return parts.length > 0 ? parts : null;
+}
+
+function isNodeCommand(command) {
+  const base = commandBase(command);
+  return base === 'node';
+}
+
+function isBunCommand(command) {
+  const base = commandBase(command);
+  return base === 'bun';
+}
+
+function isDenoCommand(command) {
+  const base = commandBase(command);
+  return base === 'deno';
+}
+
+function commandBase(command) {
+  if (typeof command !== 'string' || command.length === 0) return '';
+  const posixBase = path.basename(command);
+  const winBase = path.win32.basename(command);
+  const base = winBase.length < posixBase.length ? winBase : posixBase;
+  return base.replace(/\\.exe$/i, '').toLowerCase();
+}
+
+function findNodeLikeScriptIndex(cmd, startIndex) {
+  for (let i = startIndex; i < cmd.length; i++) {
+    const arg = cmd[i];
+    if (typeof arg !== 'string' || arg.length === 0) return -1;
+    if (arg === '-e' || arg === '--eval' || arg === '-p' || arg === '--print') return -2;
+    if (arg.startsWith('--eval=') || arg.startsWith('--print=')) return -2;
+    if (isNodeLikeOptionWithValue(arg)) {
+      i += 1;
+      continue;
+    }
+    if (hasInlineNodeLikeOptionValue(arg)) continue;
+    if (isNodeLikeValuelessOption(arg)) continue;
+    if (arg.startsWith('-')) return -1;
+    return i;
+  }
+  return -1;
+}
+
+function findBunScriptIndex(cmd, startIndex) {
+  for (let i = startIndex; i < cmd.length; i++) {
+    const arg = cmd[i];
+    if (typeof arg !== 'string' || arg.length === 0) return -1;
+    if (arg === '-e' || arg === '--eval' || arg === '-p' || arg === '--print') return -2;
+    if (arg.startsWith('--eval=') || arg.startsWith('--print=')) return -2;
+    if (isBunOptionWithValue(arg)) {
+      i += 1;
+      continue;
+    }
+    if (hasInlineBunOptionValue(arg)) continue;
+    if (isBunValuelessOption(arg)) continue;
+    if (arg === 'run') {
+      return findScriptAfterSubcommand(cmd, i + 1, 'bun');
+    }
+    if (arg.startsWith('-')) return -1;
+    return i;
+  }
+  return -1;
+}
+
+function findDenoScriptIndex(cmd, startIndex) {
+  for (let i = startIndex; i < cmd.length; i++) {
+    const arg = cmd[i];
+    if (typeof arg !== 'string' || arg.length === 0) return -1;
+    if (arg === 'eval') return -2;
+    if (arg === 'run' || arg === 'test' || arg === 'bench' || arg === 'check') {
+      return findScriptAfterSubcommand(cmd, i + 1, 'deno');
+    }
+    if (isDenoOptionWithValue(arg)) {
+      i += 1;
+      continue;
+    }
+    if (hasInlineDenoOptionValue(arg)) continue;
+    if (isDenoValuelessOption(arg)) continue;
+    if (arg.startsWith('-')) return -1;
+    return i;
+  }
+  return -1;
+}
+
+function findScriptAfterSubcommand(cmd, startIndex, runtime) {
+  for (let i = startIndex; i < cmd.length; i++) {
+    const arg = cmd[i];
+    if (typeof arg !== 'string' || arg.length === 0) return -1;
+    if (runtime === 'bun' && isBunOptionWithValue(arg)) {
+      i += 1;
+      continue;
+    }
+    if (runtime === 'deno' && isDenoOptionWithValue(arg)) {
+      i += 1;
+      continue;
+    }
+    if (runtime === 'bun' && hasInlineBunOptionValue(arg)) continue;
+    if (runtime === 'deno' && hasInlineDenoOptionValue(arg)) continue;
+    if (runtime === 'bun' && isBunValuelessOption(arg)) continue;
+    if (runtime === 'deno' && isDenoValuelessOption(arg)) continue;
+    if (arg.startsWith('-')) return -1;
+    return i;
+  }
+  return -1;
+}
+
+function isNodeLikeOptionWithValue(arg) {
+  return (
+    arg === '-C' ||
+    arg === '-r' ||
+    arg === '--conditions' ||
+    arg === '--debug-port' ||
+    arg === '--disable-warning' ||
+    arg === '--env-file' ||
+    arg === '--env-file-if-exists' ||
+    arg === '--experimental-config-file' ||
+    arg === '--experimental-loader' ||
+    arg === '--import' ||
+    arg === '--inspect-publish-uid' ||
+    arg === '--loader' ||
+    arg === '--localstorage-file' ||
+    arg === '--require'
+  );
+}
+
+function hasInlineNodeLikeOptionValue(arg) {
+  return (
+    arg.startsWith('--conditions=') ||
+    arg.startsWith('--debug-port=') ||
+    arg.startsWith('--disable-warning=') ||
+    arg.startsWith('--env-file=') ||
+    arg.startsWith('--env-file-if-exists=') ||
+    arg.startsWith('--experimental-config-file=') ||
+    arg.startsWith('--experimental-loader=') ||
+    arg.startsWith('--import=') ||
+    arg.startsWith('--inspect-publish-uid=') ||
+    arg.startsWith('--loader=') ||
+    arg.startsWith('--localstorage-file=') ||
+    arg.startsWith('--require=')
+  );
+}
+
+function isNodeLikeValuelessOption(arg) {
+  return (
+    arg === '-' ||
+    arg === '-c' ||
+    arg === '--' ||
+    arg === '--check' ||
+    arg === '--cpu-prof' ||
+    arg === '--enable-source-maps' ||
+    arg === '--expose-gc' ||
+    arg === '--inspect' ||
+    arg === '--inspect-brk' ||
+    arg === '--inspect-wait' ||
+    arg === '--no-deprecation' ||
+    arg === '--no-warnings' ||
+    arg === '--preserve-symlinks' ||
+    arg === '--preserve-symlinks-main' ||
+    arg === '--throw-deprecation' ||
+    arg === '--trace-deprecation' ||
+    arg === '--trace-warnings'
+  );
+}
+
+function isBunOptionWithValue(arg) {
+  return (
+    arg === '-c' ||
+    arg === '-d' ||
+    arg === '-F' ||
+    arg === '-l' ||
+    arg === '-r' ||
+    arg === '--config' ||
+    arg === '--conditions' ||
+    arg === '--console-depth' ||
+    arg === '--cpu-prof-dir' ||
+    arg === '--cpu-prof-interval' ||
+    arg === '--cpu-prof-name' ||
+    arg === '--cwd' ||
+    arg === '--define' ||
+    arg === '--dns-result-order' ||
+    arg === '--drop' ||
+    arg === '--elide-lines' ||
+    arg === '--env-file' ||
+    arg === '--extension-order' ||
+    arg === '--feature' ||
+    arg === '--fetch-preconnect' ||
+    arg === '--filter' ||
+    arg === '--import' ||
+    arg === '--inspect' ||
+    arg === '--inspect-brk' ||
+    arg === '--inspect-wait' ||
+    arg === '--install' ||
+    arg === '--jsx-factory' ||
+    arg === '--jsx-fragment' ||
+    arg === '--jsx-import-source' ||
+    arg === '--jsx-runtime' ||
+    arg === '--loader' ||
+    arg === '--main-fields' ||
+    arg === '--max-http-header-size' ||
+    arg === '--port' ||
+    arg === '--preload' ||
+    arg === '--require' ||
+    arg === '--shell' ||
+    arg === '--title' ||
+    arg === '--tsconfig-override' ||
+    arg === '--unhandled-rejections' ||
+    arg === '--user-agent'
+  );
+}
+
+function hasInlineBunOptionValue(arg) {
+  return (
+    arg.startsWith('--config=') ||
+    arg.startsWith('--conditions=') ||
+    arg.startsWith('--console-depth=') ||
+    arg.startsWith('--cpu-prof-dir=') ||
+    arg.startsWith('--cpu-prof-interval=') ||
+    arg.startsWith('--cpu-prof-name=') ||
+    arg.startsWith('--cwd=') ||
+    arg.startsWith('--define=') ||
+    arg.startsWith('--dns-result-order=') ||
+    arg.startsWith('--drop=') ||
+    arg.startsWith('--elide-lines=') ||
+    arg.startsWith('--env-file=') ||
+    arg.startsWith('--extension-order=') ||
+    arg.startsWith('--feature=') ||
+    arg.startsWith('--fetch-preconnect=') ||
+    arg.startsWith('--filter=') ||
+    arg.startsWith('--import=') ||
+    arg.startsWith('--inspect=') ||
+    arg.startsWith('--inspect-brk=') ||
+    arg.startsWith('--inspect-wait=') ||
+    arg.startsWith('--install=') ||
+    arg.startsWith('--jsx-factory=') ||
+    arg.startsWith('--jsx-fragment=') ||
+    arg.startsWith('--jsx-import-source=') ||
+    arg.startsWith('--jsx-runtime=') ||
+    arg.startsWith('--loader=') ||
+    arg.startsWith('--main-fields=') ||
+    arg.startsWith('--max-http-header-size=') ||
+    arg.startsWith('--port=') ||
+    arg.startsWith('--preload=') ||
+    arg.startsWith('--require=') ||
+    arg.startsWith('--shell=') ||
+    arg.startsWith('--title=') ||
+    arg.startsWith('--tsconfig-override=') ||
+    arg.startsWith('--unhandled-rejections=') ||
+    arg.startsWith('--user-agent=')
+  );
+}
+
+function isBunValuelessOption(arg) {
+  return (
+    arg === '-b' ||
+    arg === '-i' ||
+    arg === '--bun' ||
+    arg === '--cpu-prof' ||
+    arg === '--cpu-prof-md' ||
+    arg === '--expose-gc' ||
+    arg === '--heap-prof' ||
+    arg === '--heap-prof-md' ||
+    arg === '--hot' ||
+    arg === '--if-present' ||
+    arg === '--ignore-dce-annotations' ||
+    arg === '--jsx-side-effects' ||
+    arg === '--no-addons' ||
+    arg === '--no-clear-screen' ||
+    arg === '--no-deprecation' ||
+    arg === '--no-env-file' ||
+    arg === '--no-exit-on-error' ||
+    arg === '--no-install' ||
+    arg === '--no-macros' ||
+    arg === '--parallel' ||
+    arg === '--prefer-latest' ||
+    arg === '--prefer-offline' ||
+    arg === '--preserve-symlinks' ||
+    arg === '--preserve-symlinks-main' ||
+    arg === '--redis-preconnect' ||
+    arg === '--sequential' ||
+    arg === '--silent' ||
+    arg === '--smol' ||
+    arg === '--sql-preconnect' ||
+    arg === '--throw-deprecation' ||
+    arg === '--use-bundled-ca' ||
+    arg === '--use-openssl-ca' ||
+    arg === '--use-system-ca' ||
+    arg === '--watch' ||
+    arg === '--workspaces' ||
+    arg === '--zero-fill-buffers'
+  );
+}
+
+function isDenoOptionWithValue(arg) {
+  return (
+    arg === '-c' ||
+    arg === '--cert' ||
+    arg === '--conditions' ||
+    arg === '--config' ||
+    arg === '--cpu-prof-dir' ||
+    arg === '--cpu-prof-interval' ||
+    arg === '--cpu-prof-name' ||
+    arg === '--ext' ||
+    arg === '--import-map' ||
+    arg === '--location' ||
+    arg === '--lock' ||
+    arg === '--minimum-dependency-age' ||
+    arg === '--preload' ||
+    arg === '--require' ||
+    arg === '--seed'
+  );
+}
+
+function hasInlineDenoOptionValue(arg) {
+  return (
+    arg.startsWith('--cert=') ||
+    arg.startsWith('--conditions=') ||
+    arg.startsWith('--config=') ||
+    arg.startsWith('--coverage=') ||
+    arg.startsWith('--cpu-prof-dir=') ||
+    arg.startsWith('--cpu-prof-interval=') ||
+    arg.startsWith('--cpu-prof-name=') ||
+    arg.startsWith('--env-file=') ||
+    arg.startsWith('--ext=') ||
+    arg.startsWith('--import-map=') ||
+    arg.startsWith('--location=') ||
+    arg.startsWith('--lock=') ||
+    arg.startsWith('--minimum-dependency-age=') ||
+    arg.startsWith('--node-modules-dir=') ||
+    arg.startsWith('--preload=') ||
+    arg.startsWith('--require=') ||
+    arg.startsWith('--seed=') ||
+    arg.startsWith('--vendor=') ||
+    arg.startsWith('--v8-flags=') ||
+    /^--(allow|deny|ignore)-[A-Za-z-]+=/.test(arg) ||
+    arg.startsWith('--permission-set=') ||
+    arg.startsWith('--reload=') ||
+    arg.startsWith('--tunnel=') ||
+    arg.startsWith('--watch=') ||
+    arg.startsWith('--watch-exclude=') ||
+    arg.startsWith('--watch-hmr=')
+  );
+}
+
+function isDenoValuelessOption(arg) {
+  return (
+    arg === '-A' ||
+    arg === '-P' ||
+    arg === '-q' ||
+    arg === '-r' ||
+    arg === '-t' ||
+    arg === '--allow-all' ||
+    arg === '--cached-only' ||
+    arg === '--coverage' ||
+    arg === '--cpu-prof' ||
+    arg === '--cpu-prof-flamegraph' ||
+    arg === '--cpu-prof-md' ||
+    arg === '--env-file' ||
+    arg === '--frozen' ||
+    arg === '--no-check' ||
+    arg === '--no-clear-screen' ||
+    arg === '--no-code-cache' ||
+    arg === '--no-config' ||
+    arg === '--no-lock' ||
+    arg === '--no-npm' ||
+    arg === '--no-prompt' ||
+    arg === '--no-remote' ||
+    arg === '--node-modules-dir' ||
+    arg === '--quiet' ||
+    arg === '--reload' ||
+    arg === '--tunnel' ||
+    arg === '--unstable' ||
+    arg === '--v8-flags' ||
+    arg === '--vendor' ||
+    arg === '--watch' ||
+    arg === '--watch-exclude' ||
+    arg === '--watch-hmr' ||
+    /^-[RWINESA]$/.test(arg) ||
+    /^--(allow|deny|ignore)-[A-Za-z-]+$/.test(arg) ||
+    arg === '--permission-set'
+  );
+}
+
+function isReadablePath(target) {
+  const resolved = resolveMaybeHome(target);
+  if (!resolved) return false;
+  try {
+    fs.accessSync(resolved, fs.constants.R_OK);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function isExplicitPath(value) {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  return value.startsWith('~/') || value.startsWith('~\\\\') || value.includes('/') || value.includes('\\\\') || /^[A-Za-z]:/.test(value);
 }
 
 function containsSequence(haystack, needle) {

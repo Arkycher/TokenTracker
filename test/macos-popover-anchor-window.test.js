@@ -99,6 +99,16 @@ test("menu-bar popover is anchored to an app-owned positioning window", () => {
   );
   assert.match(
     viewModel,
+    /func\s+refreshForPopoverOpen\([\s\S]*if\s+isLoading\s*\{\s*shouldReloadAfterCurrentLoad\s*=\s*true\s*return\s*\}[\s\S]*guard\s+!isSyncing\s+else\s*\{\s*return\s*\}/,
+    "Popover-open refresh should queue a follow-up load when another load is in flight.",
+  );
+  assert.doesNotMatch(
+    viewModel,
+    /guard\s+!isLoading\s*,\s*!isSyncing\s+else\s*\{\s*return\s*\}/,
+    "Popover-open refresh must not drop freshness requests while a load is already in flight.",
+  );
+  assert.match(
+    viewModel,
     /private\s+func\s+runQueuedReloadIfNeeded\(\)\s+async[\s\S]*shouldReloadAfterCurrentLoad\s*=\s*false[\s\S]*await\s+loadAll\(\)/,
     "A queued reload should run after the current load finishes so sync-now can refresh stale data.",
   );

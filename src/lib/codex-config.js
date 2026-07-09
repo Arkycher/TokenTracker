@@ -55,12 +55,12 @@ async function restoreNotify({ configPath, notifyOriginalPath, expectedNotify })
   const originalNotify = Array.isArray(original?.notify) ? original.notify : null;
   const currentNotify = extractNotify(text);
 
-  if (expectedNotify && !arraysEqual(currentNotify, expectedNotify)) {
-    return { restored: false, skippedReason: "current-not-managed" };
+  if (!originalNotify && expectedNotify && currentNotify == null) {
+    return { restored: false, skippedReason: "no-backup-not-installed" };
   }
 
-  if (!originalNotify && expectedNotify && !arraysEqual(currentNotify, expectedNotify)) {
-    return { restored: false, skippedReason: "no-backup-not-installed" };
+  if (expectedNotify && !arraysEqual(currentNotify, expectedNotify)) {
+    return { restored: false, skippedReason: "current-not-managed" };
   }
 
   const updated = originalNotify ? setNotify(text, originalNotify) : removeNotify(text);
@@ -166,10 +166,10 @@ function extractNotify(text) {
 
     const rhs = (m[1] || "").trim();
     const literal = readTomlArrayLiteral(lines, i, rhs);
-    if (!literal) continue;
+    if (!literal) return null;
 
     const parsed = parseTomlStringArray(literal);
-    if (parsed) return parsed;
+    return parsed;
   }
   return null;
 }
@@ -225,45 +225,78 @@ function removeNotify(text) {
 function parseTomlStringArray(rhs) {
   // Minimal parser for TOML basic/literal string arrays.
   if (!rhs.startsWith("[") || !rhs.endsWith("]")) return null;
-  const inner = rhs.slice(1, -1).trim();
-  if (!inner) return [];
 
   const parts = [];
-  let current = "";
-  let inString = false;
-  let quote = null;
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i];
-    if (!inString) {
-      if (ch === '"' || ch === "'") {
-        inString = true;
-        quote = ch;
-        current = "";
+  let i = 1;
+  let expectValue = true;
+
+  function skipSpaceAndComments() {
+    while (i < rhs.length) {
+      const ch = rhs[i];
+      if (/\s/.test(ch)) {
+        i += 1;
+        continue;
       }
-      continue;
+      if (ch === "#") {
+        while (i < rhs.length && rhs[i] !== "\n") i += 1;
+        continue;
+      }
+      break;
     }
-    if (ch === quote) {
-      parts.push(current);
-      inString = false;
-      quote = null;
-      continue;
-    }
-    if (quote === '"' && ch === "\\") {
-      if (i + 1 >= inner.length) return null;
-      const next = inner[++i];
-      if (next === "b") current += "\b";
-      else if (next === "t") current += "\t";
-      else if (next === "n") current += "\n";
-      else if (next === "f") current += "\f";
-      else if (next === "r") current += "\r";
-      else if (next === '"' || next === "\\" || next === "/") current += next;
-      else return null;
-      continue;
-    }
-    current += ch;
   }
 
-  return parts.length > 0 ? parts : null;
+  function parseString() {
+    const quote = rhs[i];
+    if (quote !== '"' && quote !== "'") return null;
+    i += 1;
+    let value = "";
+    while (i < rhs.length) {
+      const ch = rhs[i];
+      if (ch === quote) {
+        i += 1;
+        return value;
+      }
+      if (ch === "\n" || ch === "\r") return null;
+      if (quote === '"' && ch === "\\") {
+        if (i + 1 >= rhs.length) return null;
+        const next = rhs[i + 1];
+        if (next === "b") value += "\b";
+        else if (next === "t") value += "\t";
+        else if (next === "n") value += "\n";
+        else if (next === "f") value += "\f";
+        else if (next === "r") value += "\r";
+        else if (next === '"' || next === "\\" || next === "/") value += next;
+        else return null;
+        i += 2;
+        continue;
+      }
+      value += ch;
+      i += 1;
+    }
+    return null;
+  }
+
+  while (i < rhs.length) {
+    skipSpaceAndComments();
+    if (rhs[i] === "]") {
+      i += 1;
+      skipSpaceAndComments();
+      return i === rhs.length ? parts : null;
+    }
+    if (!expectValue) {
+      if (rhs[i] !== ",") return null;
+      i += 1;
+      expectValue = true;
+      continue;
+    }
+
+    const value = parseString();
+    if (value == null) return null;
+    parts.push(value);
+    expectValue = false;
+  }
+
+  return null;
 }
 
 function formatTomlStringArray(arr) {
@@ -278,6 +311,7 @@ function readTomlArrayLiteral(lines, startIndex, rhs) {
   let quote = null;
   let depth = 0;
   let sawOpen = false;
+  let invalid = false;
 
   function scanChunk(chunk) {
     for (let i = 0; i < chunk.length; i++) {
@@ -295,7 +329,10 @@ function readTomlArrayLiteral(lines, startIndex, rhs) {
         }
         if (ch === "]") {
           depth -= 1;
-          if (sawOpen && depth === 0) return i;
+          if (sawOpen && depth === 0) {
+            if (!isTomlArrayTrailer(chunk.slice(i + 1))) invalid = true;
+            return i;
+          }
         }
         continue;
       }
@@ -305,6 +342,10 @@ function readTomlArrayLiteral(lines, startIndex, rhs) {
         continue;
       }
       if (quote === '"' && ch === "\\") {
+        if (i + 1 >= chunk.length) {
+          invalid = true;
+          return -1;
+        }
         i += 1;
       }
     }
@@ -313,11 +354,13 @@ function readTomlArrayLiteral(lines, startIndex, rhs) {
 
   const parts = [first];
   let endPos = scanChunk(first);
+  if (invalid) return null;
   if (endPos !== -1) return first.slice(0, endPos + 1).trim();
 
   for (let j = startIndex + 1; j < lines.length; j++) {
     const line = lines[j];
     endPos = scanChunk(line);
+    if (invalid) return null;
     if (endPos !== -1) {
       parts.push(line.slice(0, endPos + 1));
       return parts.join("\n").trim();
@@ -336,6 +379,7 @@ function findTomlArrayBlockEnd(lines, startIndex, rhs) {
   let quote = null;
   let depth = 0;
   let sawOpen = false;
+  let invalid = false;
 
   function scanChunk(chunk) {
     for (let i = 0; i < chunk.length; i++) {
@@ -353,7 +397,10 @@ function findTomlArrayBlockEnd(lines, startIndex, rhs) {
         }
         if (ch === "]") {
           depth -= 1;
-          if (sawOpen && depth === 0) return true;
+          if (sawOpen && depth === 0) {
+            if (!isTomlArrayTrailer(chunk.slice(i + 1))) invalid = true;
+            return true;
+          }
         }
         continue;
       }
@@ -363,6 +410,10 @@ function findTomlArrayBlockEnd(lines, startIndex, rhs) {
         continue;
       }
       if (quote === '"' && ch === "\\") {
+        if (i + 1 >= chunk.length) {
+          invalid = true;
+          return false;
+        }
         i += 1;
       }
     }
@@ -370,10 +421,16 @@ function findTomlArrayBlockEnd(lines, startIndex, rhs) {
   }
 
   if (scanChunk(first)) return startIndex;
+  if (invalid) return startIndex;
   for (let j = startIndex + 1; j < lines.length; j++) {
     if (scanChunk(lines[j])) return j;
+    if (invalid) return startIndex;
   }
   return startIndex;
+}
+
+function isTomlArrayTrailer(text) {
+  return /^\s*(?:#.*)?$/.test(text);
 }
 
 function arraysEqual(a, b) {

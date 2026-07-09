@@ -279,7 +279,11 @@ class DashboardViewModel: ObservableObject {
         syncInterval: TimeInterval = BackgroundRefreshPolicy.defaultPopoverOpenSyncInterval,
         loadInterval: TimeInterval = BackgroundRefreshPolicy.defaultPopoverOpenLoadInterval
     ) async {
-        guard !isLoading, !isSyncing else { return }
+        if isLoading {
+            shouldReloadAfterCurrentLoad = true
+            return
+        }
+        guard !isSyncing else { return }
         let shouldSync = BackgroundRefreshPolicy.shouldRunPopoverOpenSync(
             now: now,
             lastAttemptAt: lastPopoverOpenSyncAttemptAt,
